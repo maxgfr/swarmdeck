@@ -386,8 +386,9 @@ swarmdeck status
 ```
 
 `mcp/server.mjs` (`swarmdeck-mcp`) is an MCP server over stdio with a tool for each of these, and
-`.mcp.json` registers it for Claude Code opened in this folder; `.claude/skills/swarmdeck/` teaches an
-AI how to use them, and what never to do without being asked (delete the files). Elsewhere:
+`.mcp.json` registers it for Claude Code opened in this folder; `skills/swarmdeck/` teaches an
+AI how to use them, and what never to do without being asked (delete the files), and
+`npx skills add maxgfr/swarmdeck` installs it for your agent. Elsewhere:
 
 ```sh
 claude mcp add swarmdeck --env SWARMDECK_URL=http://127.0.0.1:8080 -- swarmdeck-mcp
@@ -757,7 +758,7 @@ require it.
 | `server/` | the real BitTorrent client, its API and its Dockerfile |
 | `cli/` | the command line, and `core.mjs`, what it and the MCP server do |
 | `mcp/` | the MCP server, for an AI |
-| `.claude/skills/swarmdeck/` | how an AI drives Swarmdeck |
+| `skills/swarmdeck/` | how an AI drives Swarmdeck |
 | `cloudflare/` | the Worker and container config for `wrangler deploy` |
 | `proxy/` | the optional CORS proxy, as a Cloudflare Worker |
 | `vendor/` | WebTorrent and client‑zip, vendored (MIT) |
