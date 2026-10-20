@@ -4,6 +4,7 @@
 # file it fetched when it runs from a checkout.
 .git
 .claude
+skills
 **/node_modules
 downloads
 test
