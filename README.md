@@ -386,12 +386,20 @@ swarmdeck status
 ```
 
 `mcp/server.mjs` (`swarmdeck-mcp`) is an MCP server over stdio with a tool for each of these, and
-`.mcp.json` registers it for Claude Code opened in this folder; `skills/swarmdeck/` teaches an
-AI how to use them, and what never to do without being asked (delete the files), and
-`npx skills add maxgfr/swarmdeck` installs it for your agent. Elsewhere:
+`skills/swarmdeck/` teaches an AI how to use them, and what never to do without being asked (delete
+the files). The skill installs into any agent (Claude Code, Codex, OpenCode, Cursor…) with
+[skills](https://github.com/vercel-labs/skills); `-a <agent>` picks the agents instead of asking:
 
 ```sh
-claude mcp add swarmdeck --env SWARMDECK_URL=http://127.0.0.1:8080 -- swarmdeck-mcp
+npx skills add maxgfr/swarmdeck
+```
+
+It installs the skill only. The MCP server is registered with each agent's own command:
+
+```sh
+claude mcp add swarmdeck --env SWARMDECK_URL=http://127.0.0.1:8080 -- swarmdeck-mcp     # Claude Code
+codex mcp add swarmdeck --env SWARMDECK_URL=http://127.0.0.1:8080 -- swarmdeck-mcp      # Codex
+opencode mcp add swarmdeck --env SWARMDECK_URL=http://127.0.0.1:8080 -- swarmdeck-mcp   # OpenCode
 ```
 
 or, in another client's configuration:
@@ -401,8 +409,10 @@ or, in another client's configuration:
   "env": { "SWARMDECK_URL": "http://127.0.0.1:8080" } } } }
 ```
 
-Neither reaches what lives in the page: the torrents running in a browser tab, the page's settings,
-and the cloud services set up there.
+In this checkout, `.mcp.json` already registers it for the clients that read a project's `.mcp.json`.
+
+Neither the server nor the skill reaches what lives in the page: the torrents running in a browser
+tab, the page's settings, and the cloud services set up there.
 
 ---
 
