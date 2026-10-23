@@ -4,3 +4,8 @@ node_modules/
 test/.tmp/
 # What the server writes when it runs from the checkout (its default DOWNLOAD_DIR).
 downloads/
+
+# skills installed by `npx skills add`
+.agents/skills/
+.claude/skills/
+skills-lock.json
