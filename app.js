@@ -7,8 +7,8 @@ import { grabEntries, filesFromEntries, droppedText, draggingFiles } from './lib
 import { canPickFolder, pickFolder, existing, writeToFolder } from './lib/folder-save.js';
 import { hashPieces } from './lib/torrent-hash.js';
 import { OPFS_HOME, STORE_DIR_RE, adoptRootStores } from './lib/opfs-home.js';
-import { openSecretBox } from './lib/secret-box.js';
-import { hasKeys, keysOf, sameKeys, withKeys, withoutKeys } from './lib/cloud-keys.js';
+import { openSecrets } from './lib/secrets.js';
+import { hasKeys, keysOf, sameKeys, wantsTurnCredential, withKeys, withoutKeys } from './lib/cloud-keys.js';
 import { createOptionsUI, creationOptions, normalizeCreate } from './lib/create-options.js';
 import { createPresetsUI, normalizePresets } from './lib/presets.js';
 import { FILTERS, SORTS, rowMatches, sortRows, rangeKeys, loadListPrefs, saveListPrefs, createTorrentList } from './lib/torrent-list.js';
@@ -302,19 +302,18 @@ function saveSettings(next) {
 let settings = loadSettings();
 
 /*
- * The cloud services' API keys. localStorage is readable by every page of the origin (on
- * maxgfr.github.io, every project page of the account), so they are never written there: they are
- * kept encrypted (AES-GCM, under a non-extractable key) in the swarmdeck-keys database, and put back
- * into the settings in memory once read — before anything that calls a service runs (cloudKeysReady).
- * Keys an earlier version left in clear in the settings are encrypted, and only once that is
- * committed taken out of them.
+ * The cloud services' API keys and the TURN servers' credentials. localStorage is readable by every
+ * page of the origin (on maxgfr.github.io, every project page of the account), so they are never
+ * written there: llm-connect's sealedStore keeps them encrypted (AES-GCM, under a non-extractable
+ * key) in the swarmdeck-sealed database (lib/secrets.js), and they are put back into the settings in
+ * memory once read — before anything that calls a service runs (cloudKeysReady), and before the
+ * WebTorrent client starts when a TURN server needs its credential. Keys an earlier version left in
+ * clear in the settings are encrypted, and only once that is committed taken out of them.
  */
-const KEYS_DB = 'swarmdeck-keys';
-const KEYS_ID = 'cloud';
 /** Written after each committed write of the keys, so other open copies read them again. */
 const KEYS_WRITTEN_KEY = 'swarmdeck:keys-written';
-const keyBox = openSecretBox(KEYS_DB);
-const NO_KEYS = { apiKey: '', accounts: {} };
+const keyBox = openSecrets();
+const NO_KEYS = { apiKey: '', accounts: {}, turn: {} };
 /** The keys as the box holds them: a save writes them again only when they changed. */
 let storedKeys = NO_KEYS;
 let keysWriting = Promise.resolve(true);
@@ -323,12 +322,12 @@ let keysWriting = Promise.resolve(true);
 function storeKeys(keys) {
   keysWriting = keysWriting.then(async () => {
     try {
-      await keyBox.write(KEYS_ID, keys);
+      if (!(await keyBox.write(keys))) throw new Error('not stored');
       storedKeys = keys;
       try { localStorage.setItem(KEYS_WRITTEN_KEY, String(Date.now())); } catch { /* the other copies read them at their next start */ }
       return true;
     } catch {
-      toast('Your API key could not be stored encrypted in this browser: it works until the page reloads. Nothing was saved in clear.', { error: true, timeout: 9000 });
+      toast('Your API key or TURN password could not be stored encrypted in this browser: it works until the page reloads. Nothing was saved in clear.', { error: true, timeout: 9000 });
       return false;
     }
   });
@@ -347,7 +346,7 @@ function forgetClearKeys() {
 
 /** Keys found in clear: encrypted first, and taken out of the settings only once that is committed. */
 async function adoptClearKeys(clear) {
-  const keys = { apiKey: clear.apiKey || storedKeys.apiKey, accounts: { ...storedKeys.accounts, ...clear.accounts } };
+  const keys = { apiKey: clear.apiKey || storedKeys.apiKey, accounts: { ...storedKeys.accounts, ...clear.accounts }, turn: { ...storedKeys.turn, ...clear.turn } };
   if (await storeKeys(keys)) forgetClearKeys();
   return keys;
 }
@@ -356,7 +355,7 @@ const cloudKeysReady = (async () => {
   const clear = keysOf(settings);
   try {
     storedKeys = (await Promise.race([
-      keyBox.read(KEYS_ID),
+      keyBox.read(),
       new Promise((resolve, reject) => setTimeout(() => reject(new Error('storage did not answer')), 5000)),
     ])) || NO_KEYS;
   } catch {
@@ -2677,6 +2676,9 @@ function renderCloud(view, note) {
 
 /* ---------- WebTorrent client ---------- */
 
+// A TURN server's credential is with the keys, sealed: read before the client takes rtcConfig, but
+// never waited on for long (cloudKeysReady gives up after 5 s), so a slow storage only costs TURN.
+if (wantsTurnCredential(settings)) await Promise.race([cloudKeysReady, new Promise((resolve) => setTimeout(resolve, 1500))]);
 const clientOpts = { tracker: { announce: settings.trackers } };
 if (settings.rtcConfig && typeof settings.rtcConfig === 'object') clientOpts.tracker.rtcConfig = settings.rtcConfig;
 
@@ -5304,7 +5306,7 @@ otherCopies?.addEventListener('message', ({ data }) => {
 window.addEventListener('storage', (event) => {
   if (event.key === KEYS_WRITTEN_KEY) {
     // Keys saved in another copy: read again from the box.
-    keyBox.read(KEYS_ID).then((keys) => {
+    keyBox.read().then((keys) => {
       if (!keys) return;
       storedKeys = keys;
       if (sameKeys(keys, keysOf(settings))) return;

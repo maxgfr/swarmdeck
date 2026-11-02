@@ -765,7 +765,7 @@ require it.
 | `lib/drop.js` | what is dropped: folders read all the way down, and text |
 | `lib/folder-save.js` | a torrent's files written into a folder of the computer |
 | `lib/opfs-home.js` | the pieces kept in OPFS under `swarmdeck/`, never at the root the origin's other sites share |
-| `lib/secret-box.js`, `lib/cloud-keys.js` | the cloud keys taken out of the settings and kept encrypted at rest |
+| `lib/secrets.js`, `lib/cloud-keys.js` | the cloud keys and TURN credentials taken out of the settings and sealed at rest (llm-connect's sealedStore, vendored in `vendor/`) |
 | `sw.js` | turns that stream into a download, and receives Web Share Target posts |
 | `server/` | the real BitTorrent client, its API and its Dockerfile |
 | `cli/` | the command line, and `core.mjs`, what it and the MCP server do |

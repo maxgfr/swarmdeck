@@ -1715,6 +1715,41 @@ try {
     log('API keys left in clear by an earlier version: encrypted, then taken out of localStorage, read back after a reload');
   }
 
+  /* ---------- A TURN password in rtcConfig: sealed with the keys, never in clear, and the client still gets it ---------- */
+  {
+    const turnCtx = await context();
+    const page = await turnCtx.newPage();
+    page.on('pageerror', (e) => console.error('turn page error:', e));
+    await page.goto(`${site.url}icon.svg`);
+    const turn = { urls: 'turn:turn.invalid:3478', username: 'turn-user', credential: 'CLEAR-TURN-PASSWORD' };
+    await page.evaluate(({ t, rtc, turn }) => localStorage.setItem('swarmdeck:settings', JSON.stringify({
+      trackers: [t], trackerList: false, rtcConfig: { ...rtc, iceServers: [...rtc.iceServers, turn] }, metadataSources: [],
+    })), { t: trackerUrl, rtc: rtcConfig, turn });
+    await page.goto(site.url);
+    await page.waitForFunction(() => window.__swarmdeck?.client);
+    await page.evaluate(() => window.__swarmdeck.started);
+    const inClear = () => page.evaluate(() => JSON.stringify({ ...localStorage }).includes('CLEAR-TURN-PASSWORD'));
+    await waitFor(() => inClear().then((c) => !c), { label: 'the TURN password taken out of localStorage', timeout: 5000 });
+    const clientTurn = () => page.evaluate(() => window.__swarmdeck.client.tracker?.rtcConfig?.iceServers?.find((s) => s.username === 'turn-user'));
+    assert.deepEqual(await clientTurn(), turn, 'the client was given the TURN server with its password');
+    await page.reload();
+    await page.waitForFunction(() => window.__swarmdeck?.client);
+    await page.evaluate(() => window.__swarmdeck.started);
+    assert.deepEqual(await clientTurn(), turn, 'and after a reload, read back from the sealed store before the client started');
+    assert.equal(await inClear(), false, 'never in clear again');
+    const atRest = await page.evaluate(() => new Promise((resolve) => {
+      const r = indexedDB.open('swarmdeck-sealed');
+      r.onsuccess = () => {
+        const all = r.result.transaction('kv', 'readonly').objectStore('kv').getAll();
+        all.onsuccess = () => resolve(all.result.filter((v) => v && v.iv).map((v) => ({ v: v.v, clear: new TextDecoder('latin1').decode(v.ciphertext).includes('CLEAR-TURN-PASSWORD') })));
+      };
+      r.onerror = () => resolve(null);
+    }));
+    assert.deepEqual(atRest, [{ v: 2, clear: false }], 'sealed in swarmdeck-sealed, the name bound to the record');
+    await turnCtx.close();
+    log('a TURN password: sealed, out of localStorage, and in the client\'s rtcConfig from its start');
+  }
+
   /* ---------- the .torrent editor ---------- */
   // Its own page, no service worker (route() must see every request, in WebKit too), so saves are
   // ordinary downloads: what the editor saved is read back here, and its info hash worked out again.
