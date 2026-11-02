@@ -1612,6 +1612,67 @@ try {
     log('upgrading from Phone Torrent: settings, list, remembered torrents and a waiting share moved to the new names, the old ones gone');
   }
 
+  /* ---------- pieces at the OPFS root, as an earlier version left them: moved into swarmdeck/ ---------- */
+  {
+    // Every project page of maxgfr.github.io shares the origin's OPFS root: the app keeps to its own
+    // directory, takes its old stores there, and leaves every other site's directories alone.
+    const rootCtx = await context();
+    const page = await rootCtx.newPage();
+    page.on('pageerror', (e) => console.error('opfs page error:', e));
+    const kept = '9999999999999999999999999999999999999999';
+    await page.goto(`${site.url}icon.svg`);
+    const prepared = await page.evaluate(async ({ t, rtc, kept }) => {
+      localStorage.setItem('swarmdeck:settings', JSON.stringify({ trackers: [t], trackerList: false, rtcConfig: rtc, metadataSources: [] }));
+      await new Promise((resolve, reject) => {
+        const req = indexedDB.open('swarmdeck', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('torrents', { keyPath: 'infoHash' });
+        req.onerror = () => reject(req.error);
+        req.onsuccess = () => {
+          const tx = req.result.transaction('torrents', 'readwrite');
+          tx.objectStore('torrents').put({
+            infoHash: kept, source: { type: 'magnet', uri: `magnet:?xt=urn:btih:${kept}&dn=kept-at-the-root` },
+            torrentFile: null, deselected: [], paused: true, cloud: null, reach: null, webSeeds: [], addedAt: 1,
+          });
+          tx.oncomplete = () => { req.result.close(); resolve(); };
+        };
+      });
+      try {
+        const root = await navigator.storage.getDirectory();
+        const write = async (dir, name, body) => {
+          const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
+          await w.write(body);
+          await w.close();
+        };
+        await write(await root.getDirectoryHandle(`kept-at-the-root - ${kept.slice(0, 8)}`, { create: true }), '0', 'piece 0');
+        await write(await root.getDirectoryHandle('orphan - 66666666', { create: true }), '0', 'gone');
+        await write(await root.getDirectoryHandle('recordings', { create: true }), 'take-1.webm', 'another site');
+        await root.getDirectoryHandle('chunks', { create: true });
+        return true;
+      } catch {
+        return false; // no OPFS writes from a page in this browser build
+      }
+    }, { t: trackerUrl, rtc: rtcConfig, kept });
+    if (prepared) {
+      await page.goto(site.url);
+      await page.waitForFunction(() => window.__swarmdeck?.client);
+      await page.evaluate(() => window.__swarmdeck.started);
+      const after = await page.evaluate(async () => {
+        const root = await navigator.storage.getDirectory();
+        const names = async (dir) => { const out = []; for await (const n of dir.keys()) out.push(n); return out.sort(); };
+        const home = await root.getDirectoryHandle('swarmdeck');
+        const piece = await (await (await (await home.getDirectoryHandle('kept-at-the-root - 99999999')).getFileHandle('0')).getFile()).text();
+        return { root: await names(root), home: await names(home), piece };
+      });
+      assert.deepEqual(after.root.filter((n) => !n.startsWith('.')), ['chunks', 'recordings', 'swarmdeck'], `only the stores left the root (found: ${after.root})`);
+      assert.deepEqual(after.home, ['kept-at-the-root - 99999999'], 'the remembered torrent\'s store moved in, the orphan dropped');
+      assert.equal(after.piece, 'piece 0', 'with its pieces');
+      log('OPFS: an earlier version\'s stores moved from the root into swarmdeck/, other sites\' directories untouched');
+    } else {
+      log('OPFS: not writable from a page in this browser build, the move into swarmdeck/ is checked by the unit tests');
+    }
+    await rootCtx.close();
+  }
+
   /* ---------- the .torrent editor ---------- */
   // Its own page, no service worker (route() must see every request, in WebKit too), so saves are
   // ordinary downloads: what the editor saved is read back here, and its info hash worked out again.
@@ -2210,7 +2271,7 @@ try {
       .filter((l) => l.name === 'swarmdeck:open-tab').length === 2), { label: 'second tab past its housekeeping', timeout: 15000 });
     const storeDirs = await secondTab.evaluate(async () => {
       const names = [];
-      for await (const name of (await navigator.storage.getDirectory()).keys()) names.push(name);
+      for await (const name of (await (await navigator.storage.getDirectory()).getDirectoryHandle('swarmdeck')).keys()) names.push(name);
       return names;
     });
     const seedHash = await seeder.evaluate(() => window.__swarmdeck.client.torrents[0].infoHash);

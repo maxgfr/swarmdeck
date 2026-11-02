@@ -764,6 +764,7 @@ require it.
 | `lib/torrent-list.js` | the list: search, filters, order, selection ranges, and its rows on the page |
 | `lib/drop.js` | what is dropped: folders read all the way down, and text |
 | `lib/folder-save.js` | a torrent's files written into a folder of the computer |
+| `lib/opfs-home.js` | the pieces kept in OPFS under `swarmdeck/`, never at the root the origin's other sites share |
 | `sw.js` | turns that stream into a download, and receives Web Share Target posts |
 | `server/` | the real BitTorrent client, its API and its Dockerfile |
 | `cli/` | the command line, and `core.mjs`, what it and the MCP server do |

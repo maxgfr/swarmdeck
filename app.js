@@ -6,6 +6,7 @@ import { parseMagnet, createTorrent, ruleFor, ruleProblems, relativePath, withPa
 import { grabEntries, filesFromEntries, droppedText, draggingFiles } from './lib/drop.js';
 import { canPickFolder, pickFolder, existing, writeToFolder } from './lib/folder-save.js';
 import { hashPieces } from './lib/torrent-hash.js';
+import { OPFS_HOME, STORE_DIR_RE, adoptRootStores } from './lib/opfs-home.js';
 import { createOptionsUI, creationOptions, normalizeCreate } from './lib/create-options.js';
 import { createPresetsUI, normalizePresets } from './lib/presets.js';
 import { FILTERS, SORTS, rowMatches, sortRows, rangeKeys, loadListPrefs, saveListPrefs, createTorrentList } from './lib/torrent-list.js';
@@ -283,13 +284,22 @@ function loadSettings() {
 
 function saveSettings(next) {
   settings = next;
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
+    return true;
+  } catch {
+    // They apply all the same, until the page reloads.
+    storageFull('these settings');
+    return false;
+  }
 }
 
 let settings = loadSettings();
 
+/* "debug" is the debug library's own key, read by WebTorrent's as it loads: other sites of the origin may
+ * use it too, so only the value this app writes counts as on, and only that one is ever removed. */
 function debugEnabled() {
-  try { return Boolean(localStorage.getItem('debug')); } catch { return false; }
+  try { return localStorage.getItem('debug') === DEBUG_NAMESPACES; } catch { return false; }
 }
 
 /* ---------- public tracker list (qBittorrent-style "automatically add trackers") ---------- */
@@ -563,7 +573,13 @@ async function dbAll() {
 }
 
 async function dbPut(record) {
-  try { await runTx('readwrite', (store) => store.put(record)); } catch { /* ignore */ }
+  try {
+    await runTx('readwrite', (store) => store.put(record));
+    return true;
+  } catch {
+    storageFull('the list of torrents');
+    return false;
+  }
 }
 
 async function dbDelete(infoHash) {
@@ -574,8 +590,10 @@ async function dbClear() {
   try { await runTx('readwrite', (store) => store.clear()); } catch { /* ignore */ }
 }
 
-/** Our OPFS store directories are named "<torrent name> - <first 8 hex of info hash>". */
-const STORE_DIR_RE = / - ([a-f0-9]{8})$/;
+/** The app's own directory of OPFS, where every torrent's store is (lib/opfs-home.js). */
+async function opfsHome() {
+  return (await navigator.storage.getDirectory()).getDirectoryHandle(OPFS_HOME, { create: true });
+}
 
 /**
  * Remove OPFS directories that belong to no remembered torrent (closed seeds, failed removals).
@@ -586,12 +604,15 @@ async function cleanOrphanStores(records) {
   if (!opfsOk) return;
   try {
     const root = await navigator.storage.getDirectory();
+    const home = await opfsHome();
     const known = new Set(records.map((r) => String(r.infoHash).slice(0, 8)));
-    for await (const name of root.keys()) {
+    // What an earlier version kept at the root comes into the app's own directory first.
+    await adoptRootStores(root, home, known);
+    for await (const name of home.keys()) {
       const m = name.match(STORE_DIR_RE);
       if (!m || known.has(m[1])) continue;
       if (client.torrents.some((t) => t.infoHash && t.infoHash.startsWith(m[1]))) continue;
-      await root.removeEntry(name, { recursive: true }).catch(() => {});
+      await home.removeEntry(name, { recursive: true }).catch(() => {});
     }
   } catch { /* ignore */ }
 }
@@ -740,8 +761,36 @@ class MemoryChunkStore {
   }
 }
 
+/**
+ * WebTorrent's own OPFS store, kept in the app's directory instead of the origin's root. The bundle
+ * does not export it: a torrent with nothing in it yet holds it, as the store it would make. Given a
+ * rootDir along with the files, it would switch to another layout (each file written out whole, the
+ * pieces kept apart in a "chunks" directory at the root); without the files it keeps the one it has
+ * always had here, one file per piece, so the stores an earlier version left are taken as they are.
+ */
+let OpfsStore;
+function opfsStore() {
+  if (OpfsStore !== undefined) return OpfsStore;
+  OpfsStore = null;
+  try {
+    const empty = client.add(null, {});
+    const Base = empty._store;
+    empty.destroy();
+    if (typeof Base === 'function' && Base !== MemoryChunkStore) {
+      OpfsStore = class extends Base {
+        constructor(chunkLength, opts = {}) {
+          super(chunkLength, { ...opts, rootDir: opfsHome(), files: undefined });
+        }
+      };
+    }
+  } catch { /* WebTorrent's default, then */ }
+  return OpfsStore;
+}
+
 function storeOpts() {
-  return opfsOk ? {} : { store: MemoryChunkStore };
+  if (!opfsOk) return { store: MemoryChunkStore };
+  const store = opfsStore();
+  return store ? { store } : {};
 }
 
 /* ---------- helpers ---------- */
@@ -767,6 +816,18 @@ function formatEta(ms) {
 
 function formatSpeed(bytesPerSecond) {
   return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+/**
+ * The origin is shared by every project page of maxgfr.github.io, and so is its storage quota: another
+ * site can fill it. What could not be stored is said, once in a while, rather than lost on the next
+ * reload without a word.
+ */
+let storageFullSaidAt = 0;
+function storageFull(what) {
+  if (Date.now() - storageFullSaidAt < 30000) return;
+  storageFullSaidAt = Date.now();
+  toast(`Storage for this site is full or unavailable: ${what} will be lost on reload.`, { error: true, timeout: 9000 });
 }
 
 function toast(message, { error = false, timeout = 4500 } = {}) {
@@ -6226,7 +6287,8 @@ async function openSettings() {
     try {
       const est = await navigator.storage.estimate();
       const kept = navigator.storage.persisted ? await navigator.storage.persisted().catch(() => null) : null;
-      els.storageInfo.textContent = `Downloaded pieces are kept in the browser's private storage so you can reload the page without losing progress. Currently using ${formatBytes(est.usage)} of ${formatBytes(est.quota)} available.`
+      // The browser counts the whole origin: every project page of maxgfr.github.io shares it.
+      els.storageInfo.textContent = `Downloaded pieces are kept in the browser's private storage so you can reload the page without losing progress. This site's storage, shared with the other pages of ${location.host}, is using ${formatBytes(est.usage)} of ${formatBytes(est.quota)} available.`
         + (kept === true ? ' The browser keeps it until you delete it.' : kept === false ? ' The browser may clear it when the device runs low on space.' : '');
     } catch { /* keep default text */ }
   }
@@ -6489,7 +6551,7 @@ els.settingsDialog.addEventListener('close', () => {
   if (wantDebug !== debugEnabled()) {
     try {
       if (wantDebug) localStorage.setItem('debug', DEBUG_NAMESPACES);
-      else localStorage.removeItem('debug');
+      else if (localStorage.getItem('debug') === DEBUG_NAMESPACES) localStorage.removeItem('debug');
     } catch { /* ignore */ }
     // The torrents may run in another open copy, which reads this as it starts; and reloading this one
     // may hand them to a copy that started without it.
@@ -6553,11 +6615,13 @@ async function deleteStoreDirs() {
   // lost the lead meanwhile (frozen, then taken over) leaves them to the one that runs the torrents now.
   try {
     if (!opfsOk || follower) throw new Error('not here');
-    const root = await navigator.storage.getDirectory();
-    for await (const name of root.keys()) {
+    const home = await opfsHome();
+    for await (const name of home.keys()) {
       if (follower) break;
-      if (STORE_DIR_RE.test(name) || name === 'chunks') await root.removeEntry(name, { recursive: true }).catch(() => {});
+      await home.removeEntry(name, { recursive: true }).catch(() => {});
     }
+    // And any an earlier version left at the root, when it was not moved in yet.
+    if (!follower) await adoptRootStores(await navigator.storage.getDirectory(), home, new Set());
   } catch { /* OPFS unavailable */ }
 }
 

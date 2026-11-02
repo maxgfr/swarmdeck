@@ -32,6 +32,7 @@ const SHELL_FILES = [
   './lib/torrent-list.js',
   './lib/drop.js',
   './lib/folder-save.js',
+  './lib/opfs-home.js',
   './styles.css',
   './icon.svg',
   './manifest.webmanifest',
