@@ -698,6 +698,17 @@ log('web seed mirror at', mirror.url);
 
 // BROWSER=webkit runs the same suite on Safari's engine (what every browser on iOS uses).
 const BROWSER = process.env.BROWSER || 'chromium';
+/*
+ * The name a download is offered under. WebKit on GitHub's Linux runners reports a download's name with
+ * each space turned into an underscore ("3_torrents.zip"); WebKit elsewhere (macOS, the Playwright image)
+ * and Chromium report it as the page set it. The app names the file the same everywhere, so that name,
+ * or on WebKit that one rewritten so, is what is checked.
+ */
+function assertOffered(download, name, message) {
+  const offered = download.suggestedFilename();
+  if (BROWSER === 'webkit' && offered === name.replace(/ /g, '_')) return;
+  assert.equal(offered, name, message);
+}
 const browser = BROWSER === 'webkit'
   ? await webkit.launch()
   : await chromium.launch({ executablePath: findChromium(), args: ['--allow-insecure-localhost'] });
@@ -1165,7 +1176,7 @@ try {
     await waitFor(() => desk.evaluate(() => [...window.__swarmdeck.views.values()].every((v) => !v.torrent.paused)), { label: 'and resumed', timeout: 5000 });
     await desk.click('.tl-row:has-text("Holiday") input');
     const [bundle] = await Promise.all([desk.waitForEvent('download'), desk.click('#bulk-save')]);
-    assert.equal(bundle.suggestedFilename(), '3 torrents.zip', 'their .torrent files, in one zip');
+    assertOffered(bundle, '3 torrents.zip', 'their .torrent files, in one zip');
     const zipped = readFileSync(await bundle.path());
     assert.equal(zipped.subarray(0, 2).toString(), 'PK');
     for (const name of ['notes.txt.torrent', 'Holiday photos.torrent', 'The.Show.S01E01.mkv.torrent']) assert.ok(zipped.includes(Buffer.from(name)), `${name} in it`);
@@ -1844,7 +1855,7 @@ try {
     // saved as one .zip — each file told whether its info hash changed.
     const zipOf = async () => {
       const [download] = await Promise.all([ed.waitForEvent('download', { timeout: 15000 }), ed.click('#ed-save')]);
-      assert.equal(download.suggestedFilename(), 'edited torrents.zip');
+      assertOffered(download, 'edited torrents.zip');
       const stamp = Date.now();
       const zipPath = path.join(TMP, `batch-${stamp}.zip`);
       const dir = path.join(TMP, `batch-${stamp}`);
@@ -2052,7 +2063,7 @@ try {
       maker.waitForEvent('download', { timeout: 30000 }),
       maker.setInputFiles('#seed-file-input', { name: 'made here.bin', mimeType: 'application/octet-stream', buffer: content }),
     ]);
-    assert.equal(download.suggestedFilename(), 'made here.bin.torrent');
+    assertOffered(download, 'made here.bin.torrent');
     const madePath = path.join(TMP, 'made here.torrent');
     await download.saveAs(madePath);
     const madeTorrent = readFileSync(madePath);
@@ -2543,7 +2554,7 @@ try {
     phone.waitForEvent('download', { timeout: 30000 }),
     phone.click('.torrent .save-torrent-btn'),
   ]);
-  assert.equal(torrentDl.suggestedFilename(), 'Swarmdeck Test.torrent');
+  assertOffered(torrentDl, 'Swarmdeck Test.torrent');
   const torrentDlPath = path.join(TMP, 'saved.torrent');
   await torrentDl.saveAs(torrentDlPath);
   const fromPhone = await phone.evaluate(() => Array.from(window.__swarmdeck.client.torrents[0].torrentFile));
@@ -2558,7 +2569,7 @@ try {
   ]);
   const savedPath = path.join(TMP, 'saved.bin');
   await download.saveAs(savedPath);
-  assert.equal(download.suggestedFilename(), files[0].name, 'download keeps the original file name');
+  assertOffered(download, files[0].name, 'download keeps the original file name');
   const savedBuf = readFileSync(savedPath);
   assert.equal(savedBuf.length, files[0].size);
   assert.equal(sha(savedBuf), files[0].sha, 'saved bytes match the seeded file');
@@ -2581,7 +2592,7 @@ try {
   ]);
   const zipPath = path.join(TMP, 'all.zip');
   await zipDownload.saveAs(zipPath);
-  assert.equal(zipDownload.suggestedFilename(), 'Swarmdeck Test.zip');
+  assertOffered(zipDownload, 'Swarmdeck Test.zip');
   const extractDir = path.join(TMP, 'unzipped');
   execFileSync('unzip', ['-q', zipPath, '-d', extractDir]);
   for (const f of files) {
@@ -2886,7 +2897,7 @@ try {
       }))));
       throw err;
     }
-    assert.equal(download.suggestedFilename(), 'Swarmdeck Test.torrent');
+    assertOffered(download, 'Swarmdeck Test.torrent');
     const where = path.join(TMP, `from-peers-${Date.now()}.torrent`);
     await download.saveAs(where);
     const buf = readFileSync(where);
@@ -3168,7 +3179,7 @@ try {
     ios.waitForEvent('download', { timeout: 30000 }),
     ios.click('.torrent .zip-btn'),
   ]);
-  assert.equal(iosZip.suggestedFilename(), 'Swarmdeck Test.zip');
+  assertOffered(iosZip, 'Swarmdeck Test.zip');
   await ios.screenshot({ path: path.join(TMP, 'ios.png'), fullPage: true });
   log('iOS-emulated save + zip OK');
 
@@ -4108,7 +4119,7 @@ try {
   ]);
   const fromSecondPath = path.join(TMP, 'saved-in-second-copy.bin');
   await fromSecond.saveAs(fromSecondPath);
-  assert.equal(fromSecond.suggestedFilename(), files[0].name, 'a file saved in the second copy keeps its name');
+  assertOffered(fromSecond, files[0].name, 'a file saved in the second copy keeps its name');
   assert.equal(sha(readFileSync(fromSecondPath)), files[0].sha, 'and its bytes');
   const [zipFromSecond] = await Promise.all([
     secondCopy.waitForEvent('download', { timeout: 60000 }),
@@ -5141,7 +5152,7 @@ try {
   ]);
   const legacyPath = path.join(TMP, 'legacy.bin');
   await legacyDownload.saveAs(legacyPath);
-  assert.equal(legacyDownload.suggestedFilename(), files[1].name);
+  assertOffered(legacyDownload, files[1].name);
   assert.equal(sha(readFileSync(legacyPath)), files[1].sha, 'blob-mode save matches the seeded file');
   log('blob fallback save OK:', legacyDownload.suggestedFilename());
 
