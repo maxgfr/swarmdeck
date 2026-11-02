@@ -18,6 +18,7 @@ import { createSummary, creationOptions, creationProblems, normalizeCreate } fro
 import { FILTERS, SORTS, rowMatches, sortRows, rangeKeys, loadListPrefs, saveListPrefs } from '../lib/torrent-list.js';
 import { grabEntries, filesFromEntries, droppedText, draggingFiles } from '../lib/drop.js';
 import { safeSegment, existing, writeToFolder } from '../lib/folder-save.js';
+import { adoptRootStores, isPieceStore } from '../lib/opfs-home.js';
 import createTorrentPackage from 'create-torrent';
 import { bencode, makeTorrent } from './torrents.mjs';
 
@@ -563,6 +564,77 @@ const u8 = (b) => new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
   await assert.rejects(writeToFolder(root, [{ path: ['Show', 'notes.txt'], size: 10, stream: streamOf('short') }]), /ended early/);
   assert.equal(String(show.files.get('notes.txt')), 'ok', 'one that was there stays as it was');
   log('saving into a folder: safe names, folders made, a short stream refused and nothing left cut short');
+}
+
+/* ---------- OPFS: the pieces in the app's own directory, the origin's root left to the other sites ---------- */
+{
+  // A directory of OPFS in memory: entries, kind, and the move of a directory where the browser has it.
+  const opfsDir = ({ movable = true } = {}) => {
+    const entries = new Map();
+    const dir = {
+      kind: 'directory',
+      map: entries,
+      async *entries() { yield* [...entries]; },
+      async *keys() { yield* [...entries.keys()]; },
+      async getDirectoryHandle(n, { create } = {}) {
+        if (!entries.has(n)) { if (!create) throw new Error('not there'); entries.set(n, opfsDir({ movable })); }
+        return entries.get(n);
+      },
+      async getFileHandle(n, { create } = {}) {
+        if (!entries.has(n)) { if (!create) throw new Error('not there'); entries.set(n, opfsFile('')); }
+        const file = entries.get(n);
+        return { ...file, createWritable: async () => ({ write: async (b) => { file.body = await new Blob([b]).text(); }, close: async () => {} }) };
+      },
+      async removeEntry(n) { entries.delete(n); },
+    };
+    return dir;
+  };
+  const opfsFile = (body) => {
+    const file = { kind: 'file', body };
+    file.getFile = async () => new Blob([file.body]);
+    return file;
+  };
+  const store = (pieces, opts) => {
+    const d = opfsDir(opts);
+    pieces.forEach((p, i) => d.map.set(String(i), opfsFile(p)));
+    return d;
+  };
+  const setUp = (opts) => {
+    const root = opfsDir(opts);
+    const home = opfsDir(opts);
+    root.map.set('swarmdeck', home);
+    root.map.set('Film - aaaaaaaa', store(['p0', 'p1'], opts)); // a torrent of the list
+    root.map.set('Gone - bbbbbbbb', store(['p0'], opts)); // an orphan of an earlier version
+    root.map.set('Kept - cccccccc', store(['old'], opts)); // in the list, and already moved
+    home.map.set('Kept - cccccccc', store(['new'], opts));
+    // Other sites of the origin: none of theirs is touched.
+    root.map.set('recordings', opfsDir());
+    root.map.set('chunks', opfsDir());
+    const notes = opfsDir();
+    notes.map.set('todo.txt', opfsFile('x'));
+    root.map.set('Notes - dddddddd', notes);
+    return { root, home };
+  };
+  assert.equal(await isPieceStore(store(['a', 'b'])), true);
+  assert.equal(await isPieceStore(setUp().root.map.get('Notes - dddddddd')), false, 'files that are not pieces');
+
+  for (const movable of [true, false]) {
+    const { root, home } = setUp({ movable });
+    if (movable) {
+      // The browser moves the directory in place.
+      root.map.get('Film - aaaaaaaa').move = async (to) => {
+        to.map.set('Film - aaaaaaaa', root.map.get('Film - aaaaaaaa'));
+        root.map.delete('Film - aaaaaaaa');
+      };
+    }
+    await adoptRootStores(root, home, new Set(['aaaaaaaa', 'cccccccc']));
+    assert.deepEqual([...root.map.keys()].sort(), ['Notes - dddddddd', 'chunks', 'recordings', 'swarmdeck'], `only stores leave the root (${movable ? 'moved' : 'copied'})`);
+    assert.deepEqual([...home.map.keys()].sort(), ['Film - aaaaaaaa', 'Kept - cccccccc']);
+    const film = home.map.get('Film - aaaaaaaa');
+    assert.deepEqual(await Promise.all(['0', '1'].map(async (n) => (await film.map.get(n).getFile()).text())), ['p0', 'p1'], 'every piece kept');
+    assert.equal(await (await home.map.get('Kept - cccccccc').map.get('0').getFile()).text(), 'new', 'one there already is not overwritten');
+  }
+  log('OPFS: pieces moved into swarmdeck/, orphans dropped, other sites\' directories at the root left alone');
 }
 
 console.log('\nAll .torrent workshop checks passed.');
