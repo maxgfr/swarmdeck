@@ -33,6 +33,8 @@ const SHELL_FILES = [
   './lib/drop.js',
   './lib/folder-save.js',
   './lib/opfs-home.js',
+  './lib/secret-box.js',
+  './lib/cloud-keys.js',
   './styles.css',
   './icon.svg',
   './manifest.webmanifest',

@@ -19,6 +19,9 @@ import { FILTERS, SORTS, rowMatches, sortRows, rangeKeys, loadListPrefs, saveLis
 import { grabEntries, filesFromEntries, droppedText, draggingFiles } from '../lib/drop.js';
 import { safeSegment, existing, writeToFolder } from '../lib/folder-save.js';
 import { adoptRootStores, isPieceStore } from '../lib/opfs-home.js';
+import { openSecretBox } from '../lib/secret-box.js';
+import { hasKeys, keysOf, sameKeys, withKeys, withoutKeys } from '../lib/cloud-keys.js';
+import { IDBFactory } from 'fake-indexeddb';
 import createTorrentPackage from 'create-torrent';
 import { bencode, makeTorrent } from './torrents.mjs';
 
@@ -635,6 +638,58 @@ const u8 = (b) => new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
     assert.equal(await (await home.map.get('Kept - cccccccc').map.get('0').getFile()).text(), 'new', 'one there already is not overwritten');
   }
   log('OPFS: pieces moved into swarmdeck/, orphans dropped, other sites\' directories at the root left alone');
+}
+
+/* ---------- the cloud services' keys: never in clear in the settings, encrypted at rest ---------- */
+{
+  const settings = {
+    trackers: ['wss://t'],
+    cloud: { provider: 'torbox', apiKey: 'TORBOX-KEY', apiBase: '', viaProxy: false, accounts: { torbox: { apiKey: 'TORBOX-KEY', apiBase: '' }, putio: { apiKey: 'PUTIO-TOKEN', apiBase: 'https://p' } } },
+  };
+  const keys = keysOf(settings);
+  assert.deepEqual(keys, { apiKey: 'TORBOX-KEY', accounts: { torbox: 'TORBOX-KEY', putio: 'PUTIO-TOKEN' } });
+  assert.equal(hasKeys(keys), true);
+  const clear = withoutKeys(settings);
+  assert.equal(/TORBOX-KEY|PUTIO-TOKEN/.test(JSON.stringify(clear)), false, 'what is written in clear has no key');
+  assert.equal(clear.cloud.accounts.putio.apiBase, 'https://p', 'and keeps everything else');
+  assert.equal(hasKeys(keysOf(clear)), false);
+  assert.deepEqual(withKeys(clear, keys), settings, 'the keys put back where they were');
+  assert.equal(sameKeys(keys, { accounts: { putio: 'PUTIO-TOKEN', torbox: 'TORBOX-KEY' }, apiKey: 'TORBOX-KEY' }), true, 'in any order');
+  assert.equal(sameKeys(keys, { apiKey: 'TORBOX-KEY', accounts: {} }), false);
+
+  // The box, on an IndexedDB of its own.
+  const indexedDB = new IDBFactory();
+  const box = openSecretBox('swarmdeck-keys', { indexedDB });
+  assert.equal(await box.read('cloud'), null, 'nothing there yet');
+  await box.write('cloud', keys);
+  assert.deepEqual(await box.read('cloud'), keys, 'read back');
+  // What the database holds: the key, which cannot be exported, and ciphertext.
+  const raw = await new Promise((resolve) => {
+    const r = indexedDB.open('swarmdeck-keys');
+    r.onsuccess = () => {
+      const tx = r.result.transaction('box', 'readonly');
+      const all = tx.objectStore('box').getAll();
+      all.onsuccess = () => { resolve(all.result); r.result.close(); };
+    };
+  });
+  const key = raw.find((v) => v instanceof CryptoKey);
+  assert.ok(key, 'an AES-GCM key');
+  assert.equal(key.extractable, false, 'that cannot be read out');
+  await assert.rejects(crypto.subtle.exportKey('raw', key));
+  const sealed = raw.find((v) => v && v.iv);
+  assert.equal(sealed.iv.length, 12);
+  assert.equal(/TORBOX-KEY|PUTIO-TOKEN/.test(Buffer.from(sealed.data).toString('latin1')), false, 'the keys only as ciphertext');
+  await box.write('cloud', keys);
+  const again = await new Promise((resolve) => {
+    const r = indexedDB.open('swarmdeck-keys');
+    r.onsuccess = () => { const g = r.result.transaction('box', 'readonly').objectStore('box').get('cloud'); g.onsuccess = () => { resolve(g.result); r.result.close(); }; };
+  });
+  assert.notDeepEqual([...again.iv], [...sealed.iv], 'a fresh IV for every write');
+  // Another tab, another connection: the same key, the same keys.
+  assert.deepEqual(await openSecretBox('swarmdeck-keys', { indexedDB }).read('cloud'), keys);
+  // No storage at all: it says so, and writes nothing anywhere.
+  await assert.rejects(openSecretBox('swarmdeck-keys', { indexedDB: null }).write('cloud', keys));
+  log('cloud keys: taken out of the settings, encrypted under a non-extractable key, a fresh IV each write');
 }
 
 console.log('\nAll .torrent workshop checks passed.');

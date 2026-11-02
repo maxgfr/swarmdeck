@@ -765,6 +765,7 @@ require it.
 | `lib/drop.js` | what is dropped: folders read all the way down, and text |
 | `lib/folder-save.js` | a torrent's files written into a folder of the computer |
 | `lib/opfs-home.js` | the pieces kept in OPFS under `swarmdeck/`, never at the root the origin's other sites share |
+| `lib/secret-box.js`, `lib/cloud-keys.js` | the cloud keys taken out of the settings and kept encrypted at rest |
 | `sw.js` | turns that stream into a download, and receives Web Share Target posts |
 | `server/` | the real BitTorrent client, its API and its Dockerfile |
 | `cli/` | the command line, and `core.mjs`, what it and the MCP server do |
@@ -807,7 +808,7 @@ The page talks to the trackers and peers BitTorrent needs, and beyond them only 
   that address, and when you download or seed: Google's (`stun.l.google.com`) and Twilio's
   (`global.stun.twilio.com`) unless **Settings → Expert → WebRTC configuration** names others.
 
-A cloud key is stored on the device and sent only to that service and, when the browser cannot make
+A cloud key is stored on the device, encrypted (AES-GCM, under a key the browser keeps non-extractable in the `swarmdeck-keys` database), never in clear in localStorage, which every page of the site's origin can read; it is sent only to that service and, when the browser cannot make
 a call directly, through the CORS proxy set in Settings, even with "route cloud API calls through my
 CORS proxy" off (with it on, every call goes through the proxy) — so set only a proxy you run. For
 TorBox and put.io the key is also inside the file links, as above. The files a cloud service or your
