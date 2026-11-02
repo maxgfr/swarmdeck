@@ -19,11 +19,12 @@ import { FILTERS, SORTS, rowMatches, sortRows, rangeKeys, loadListPrefs, saveLis
 import { grabEntries, filesFromEntries, droppedText, draggingFiles } from '../lib/drop.js';
 import { safeSegment, existing, writeToFolder } from '../lib/folder-save.js';
 import { adoptRootStores, isPieceStore } from '../lib/opfs-home.js';
-import { openSecretBox } from '../lib/secret-box.js';
-import { hasKeys, keysOf, sameKeys, withKeys, withoutKeys } from '../lib/cloud-keys.js';
-import { IDBFactory } from 'fake-indexeddb';
+import { hasKeys, keysOf, sameKeys, wantsTurnCredential, withKeys, withoutKeys } from '../lib/cloud-keys.js';
+import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
+import { openSecrets, SECRETS_DB } from '../lib/secrets.js';
 import createTorrentPackage from 'create-torrent';
 import { bencode, makeTorrent } from './torrents.mjs';
+import { readFileSync } from 'node:fs';
 
 const log = (...a) => console.log('•', ...a);
 const body = (n, seed = 1) => {
@@ -640,14 +641,14 @@ const u8 = (b) => new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
   log('OPFS: pieces moved into swarmdeck/, orphans dropped, other sites\' directories at the root left alone');
 }
 
-/* ---------- the cloud services' keys: never in clear in the settings, encrypted at rest ---------- */
+/* ---------- the cloud services' keys and TURN credentials: never in clear in the settings, sealed at rest ---------- */
 {
   const settings = {
     trackers: ['wss://t'],
     cloud: { provider: 'torbox', apiKey: 'TORBOX-KEY', apiBase: '', viaProxy: false, accounts: { torbox: { apiKey: 'TORBOX-KEY', apiBase: '' }, putio: { apiKey: 'PUTIO-TOKEN', apiBase: 'https://p' } } },
   };
   const keys = keysOf(settings);
-  assert.deepEqual(keys, { apiKey: 'TORBOX-KEY', accounts: { torbox: 'TORBOX-KEY', putio: 'PUTIO-TOKEN' } });
+  assert.deepEqual(keys, { apiKey: 'TORBOX-KEY', accounts: { torbox: 'TORBOX-KEY', putio: 'PUTIO-TOKEN' }, turn: {} });
   assert.equal(hasKeys(keys), true);
   const clear = withoutKeys(settings);
   assert.equal(/TORBOX-KEY|PUTIO-TOKEN/.test(JSON.stringify(clear)), false, 'what is written in clear has no key');
@@ -657,39 +658,101 @@ const u8 = (b) => new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
   assert.equal(sameKeys(keys, { accounts: { putio: 'PUTIO-TOKEN', torbox: 'TORBOX-KEY' }, apiKey: 'TORBOX-KEY' }), true, 'in any order');
   assert.equal(sameKeys(keys, { apiKey: 'TORBOX-KEY', accounts: {} }), false);
 
-  // The box, on an IndexedDB of its own.
-  const indexedDB = new IDBFactory();
-  const box = openSecretBox('swarmdeck-keys', { indexedDB });
-  assert.equal(await box.read('cloud'), null, 'nothing there yet');
-  await box.write('cloud', keys);
-  assert.deepEqual(await box.read('cloud'), keys, 'read back');
-  // What the database holds: the key, which cannot be exported, and ciphertext.
-  const raw = await new Promise((resolve) => {
-    const r = indexedDB.open('swarmdeck-keys');
+  // TURN servers' credentials, by server: the order of the list may change, the username and urls stay.
+  const turnServer = { urls: 'turn:turn.example:3478', username: 'me', credential: 'TURN-PASS' };
+  const rtc = { ...settings, rtcConfig: { iceServers: [{ urls: 'stun:stun.example' }, turnServer] } };
+  const rtcKeys = keysOf(rtc);
+  assert.deepEqual(Object.values(rtcKeys.turn), ['TURN-PASS']);
+  const rtcClear = withoutKeys(rtc);
+  assert.equal(JSON.stringify(rtcClear).includes('TURN-PASS'), false, 'no TURN credential in what is written in clear');
+  assert.deepEqual(rtcClear.rtcConfig.iceServers[1], { urls: 'turn:turn.example:3478', username: 'me' }, 'and the server otherwise as it was');
+  assert.equal(wantsTurnCredential(rtcClear), true, 'a server whose credential is to be read back');
+  assert.equal(wantsTurnCredential(rtc), false);
+  assert.equal(wantsTurnCredential(settings), false, 'no TURN server, nothing to wait for');
+  assert.deepEqual(withKeys(rtcClear, rtcKeys), rtc, 'the credential put back on its server');
+  const reordered = { ...rtcClear, rtcConfig: { iceServers: [...rtcClear.rtcConfig.iceServers].reverse() } };
+  assert.equal(withKeys(reordered, rtcKeys).rtcConfig.iceServers[0].credential, 'TURN-PASS', 'whatever its place in the list');
+  assert.equal(sameKeys(rtcKeys, keys), false, 'a credential is a change of the keys');
+  assert.equal(hasKeys({ turn: { x: 'y' } }), true);
+
+  // The sealed store (llm-connect's sealedStore), on an IndexedDB of its own.
+  globalThis.indexedDB = new IDBFactory();
+  const rawRecords = (name, store) => new Promise((resolve) => {
+    const r = indexedDB.open(name);
     r.onsuccess = () => {
-      const tx = r.result.transaction('box', 'readonly');
-      const all = tx.objectStore('box').getAll();
+      const all = r.result.transaction(store, 'readonly').objectStore(store).getAll();
       all.onsuccess = () => { resolve(all.result); r.result.close(); };
     };
   });
+  const dbNames = async () => (await indexedDB.databases()).map((d) => d.name).sort();
+  const box = openSecrets();
+  assert.equal(await box.read(), null, 'nothing there yet');
+  assert.equal(await box.write(rtcKeys), true, 'stored');
+  assert.deepEqual(await box.read(), rtcKeys, 'read back');
+  const raw = await rawRecords(SECRETS_DB, 'kv');
   const key = raw.find((v) => v instanceof CryptoKey);
   assert.ok(key, 'an AES-GCM key');
   assert.equal(key.extractable, false, 'that cannot be read out');
   await assert.rejects(crypto.subtle.exportKey('raw', key));
   const sealed = raw.find((v) => v && v.iv);
-  assert.equal(sealed.iv.length, 12);
-  assert.equal(/TORBOX-KEY|PUTIO-TOKEN/.test(Buffer.from(sealed.data).toString('latin1')), false, 'the keys only as ciphertext');
-  await box.write('cloud', keys);
-  const again = await new Promise((resolve) => {
-    const r = indexedDB.open('swarmdeck-keys');
-    r.onsuccess = () => { const g = r.result.transaction('box', 'readonly').objectStore('box').get('cloud'); g.onsuccess = () => { resolve(g.result); r.result.close(); }; };
-  });
-  assert.notDeepEqual([...again.iv], [...sealed.iv], 'a fresh IV for every write');
+  assert.equal(sealed.v, 2, 'the name bound to the record');
+  assert.equal(/TORBOX-KEY|PUTIO-TOKEN|TURN-PASS/.test(Buffer.from(sealed.ciphertext).toString('latin1')), false, 'the keys only as ciphertext');
   // Another tab, another connection: the same key, the same keys.
-  assert.deepEqual(await openSecretBox('swarmdeck-keys', { indexedDB }).read('cloud'), keys);
-  // No storage at all: it says so, and writes nothing anywhere.
-  await assert.rejects(openSecretBox('swarmdeck-keys', { indexedDB: null }).write('cloud', keys));
-  log('cloud keys: taken out of the settings, encrypted under a non-extractable key, a fresh IV each write');
+  assert.deepEqual(await openSecrets().read(), rtcKeys);
+
+  // Keys sealed by an earlier version's own code, in swarmdeck-keys: moved over, then that database dropped.
+  globalThis.indexedDB = new IDBFactory();
+  {
+    const old = await new Promise((resolve, reject) => {
+      const r = indexedDB.open('swarmdeck-keys', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('box');
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+    const oldKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, oldKey, new TextEncoder().encode(JSON.stringify(keys)));
+    await new Promise((resolve, reject) => {
+      const tx = old.transaction('box', 'readwrite');
+      tx.objectStore('box').put(oldKey, 'aes-gcm-key');
+      tx.objectStore('box').put({ iv, data }, 'cloud');
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    old.close();
+  }
+  assert.deepEqual(await openSecrets().read(), keys, 'the keys an earlier version sealed, read');
+  for (let i = 0; i < 20 && (await dbNames()).includes('swarmdeck-keys'); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(await dbNames(), [SECRETS_DB], 'moved into the sealed store, the old database dropped');
+  assert.deepEqual(await openSecrets().read(), keys, 'and read from there next time');
+
+  // A storage that refuses the write: it says so, and nothing is written anywhere.
+  const put = IDBObjectStore.prototype.put;
+  IDBObjectStore.prototype.put = function () { throw new DOMException('The quota has been exceeded.', 'QuotaExceededError'); };
+  try {
+    assert.equal(await openSecrets().write({ apiKey: 'NEW-KEY', accounts: {}, turn: {} }), false, 'a write the storage refused is not said to be stored');
+  } finally {
+    IDBObjectStore.prototype.put = put;
+  }
+  assert.deepEqual(await openSecrets().read(), keys, 'and the keys stored before are still there');
+  // No storage at all: it says so.
+  delete globalThis.indexedDB;
+  await assert.rejects(openSecrets().read());
+  assert.equal(await openSecrets().write(keys), false);
+  log('cloud keys and TURN credentials: taken out of the settings, sealed under a non-extractable key, moved from the old box');
+}
+
+/* ---------- vendor/llm-connect-sealed-store.js: llm-connect's file, as published ---------- */
+{
+  const vendored = readFileSync(new URL('../vendor/llm-connect-sealed-store.js', import.meta.url), 'utf8');
+  const pkg = new URL('../node_modules/llm-connect/', import.meta.url);
+  const { version } = JSON.parse(readFileSync(new URL('package.json', pkg), 'utf8'));
+  const header = vendored.slice(0, vendored.indexOf('\n\n') + 2);
+  assert.ok(header.startsWith(`// Vendored from llm-connect@${version}, build/sealed-store.js`), `the header names the installed llm-connect (${version})`);
+  assert.match(header, /Do not edit/);
+  assert.equal(vendored.slice(header.length), readFileSync(new URL('build/sealed-store.js', pkg), 'utf8'), 'byte for byte the package\'s build/sealed-store.js');
+  assert.doesNotMatch(vendored, /^\s*import\s/m, 'and it imports nothing, so it runs as it is');
+  log('vendor/llm-connect-sealed-store.js is llm-connect\'s own file');
 }
 
 console.log('\nAll .torrent workshop checks passed.');
