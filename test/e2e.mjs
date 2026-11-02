@@ -1684,6 +1684,37 @@ try {
     await rootCtx.close();
   }
 
+  /* ---------- API keys an earlier version left in clear: encrypted, then taken out of the settings ---------- */
+  {
+    const keysCtx = await context();
+    const page = await keysCtx.newPage();
+    page.on('pageerror', (e) => console.error('keys page error:', e));
+    await page.goto(`${site.url}icon.svg`);
+    await page.evaluate(({ t, rtc }) => localStorage.setItem('swarmdeck:settings', JSON.stringify({
+      trackers: [t], trackerList: false, rtcConfig: rtc, metadataSources: [], downloadLimit: 123,
+      cloud: { provider: 'torbox', apiKey: 'CLEAR-TORBOX-KEY', apiBase: 'https://api.torbox.invalid', viaProxy: false, accounts: { putio: { apiKey: 'CLEAR-PUTIO-TOKEN', apiBase: '' } } },
+    })), { t: trackerUrl, rtc: rtcConfig });
+    await page.goto(site.url);
+    await page.waitForFunction(() => window.__swarmdeck?.client);
+    await page.evaluate(() => window.__swarmdeck.started);
+    const inClear = () => page.evaluate(() => /CLEAR-TORBOX-KEY|CLEAR-PUTIO-TOKEN/.test(JSON.stringify({ ...localStorage })));
+    await waitFor(() => inClear().then((c) => !c), { label: 'the clear keys taken out of localStorage', timeout: 5000 });
+    const after = await page.evaluate(() => ({
+      keys: [window.__swarmdeck.settings.cloud.apiKey, window.__swarmdeck.settings.cloud.accounts.putio?.apiKey],
+      rest: JSON.parse(localStorage.getItem('swarmdeck:settings')),
+    }));
+    assert.deepEqual(after.keys, ['CLEAR-TORBOX-KEY', 'CLEAR-PUTIO-TOKEN'], 'the keys still there to use');
+    assert.equal(after.rest.downloadLimit, 123, 'and the rest of the settings as it was');
+    assert.equal(after.rest.cloud.apiBase, 'https://api.torbox.invalid');
+    await page.reload();
+    await page.waitForFunction(() => window.__swarmdeck?.client);
+    await page.evaluate(() => window.__swarmdeck.started);
+    assert.deepEqual(await page.evaluate(() => [window.__swarmdeck.settings.cloud.apiKey, window.__swarmdeck.settings.cloud.accounts.putio?.apiKey]), ['CLEAR-TORBOX-KEY', 'CLEAR-PUTIO-TOKEN'], 'read back from the encrypted store after a reload');
+    assert.equal(await inClear(), false, 'and never in clear again');
+    await keysCtx.close();
+    log('API keys left in clear by an earlier version: encrypted, then taken out of localStorage, read back after a reload');
+  }
+
   /* ---------- the .torrent editor ---------- */
   // Its own page, no service worker (route() must see every request, in WebKit too), so saves are
   // ordinary downloads: what the editor saved is read back here, and its info hash worked out again.
@@ -3288,7 +3319,10 @@ try {
   await ios.click('#settings-dialog button[value="save"]');
   await ios.waitForSelector('#settings-dialog[open]', { state: 'detached', timeout: 5000 }).catch(() => {});
   await savedService(ios, 'torbox');
-  log('cloud key validated and saved');
+  // localStorage is read by every page of the origin: the key goes encrypted to swarmdeck-keys instead.
+  await waitFor(() => ios.evaluate(() => Boolean(localStorage.getItem('swarmdeck:keys-written'))), { label: 'the key stored encrypted', timeout: 5000 });
+  assert.equal(await ios.evaluate(() => JSON.stringify({ ...localStorage }).includes('test-api-key')), false, 'no key in clear in localStorage');
+  log('cloud key validated and saved, encrypted, nowhere in clear');
 
   const privateCard = ios.locator('.torrent', { has: ios.locator('.name', { hasText: 'private release.bin' }) }).first();
   await privateCard.locator('.nopeers-cloud-btn').click();
@@ -3342,11 +3376,12 @@ try {
       cards: [...document.querySelectorAll('.torrent .name')].map((e) => e.textContent),
       cloudStates: [...document.querySelectorAll('.cloud-state')].map((e) => e.textContent),
       views: [...window.__swarmdeck.views.values()].map((v) => ({ name: v.torrent.name, cloud: v.cloud, record: v.record && v.record.cloud })),
-      key: Boolean(JSON.parse(localStorage.getItem('swarmdeck:settings') || '{}').cloud?.apiKey), // no key → nothing polls
+      key: Boolean(window.__swarmdeck.settings.cloud?.apiKey), // no key → nothing polls
     }))));
     throw err;
   }
-  log('cloud transfer restored after reload');
+  assert.equal(await ios.evaluate(() => JSON.stringify({ ...localStorage }).includes('test-api-key')), false, 'and still none in clear after it');
+  log('cloud transfer restored after reload, with the key read back from its encrypted store');
 
   /* ---------- the same round trip on put.io, whose API looks nothing like TorBox's ---------- */
   putioApi.state.payload = rnd(30000, 31);

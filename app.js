@@ -7,6 +7,8 @@ import { grabEntries, filesFromEntries, droppedText, draggingFiles } from './lib
 import { canPickFolder, pickFolder, existing, writeToFolder } from './lib/folder-save.js';
 import { hashPieces } from './lib/torrent-hash.js';
 import { OPFS_HOME, STORE_DIR_RE, adoptRootStores } from './lib/opfs-home.js';
+import { openSecretBox } from './lib/secret-box.js';
+import { hasKeys, keysOf, sameKeys, withKeys, withoutKeys } from './lib/cloud-keys.js';
 import { createOptionsUI, creationOptions, normalizeCreate } from './lib/create-options.js';
 import { createPresetsUI, normalizePresets } from './lib/presets.js';
 import { FILTERS, SORTS, rowMatches, sortRows, rangeKeys, loadListPrefs, saveListPrefs, createTorrentList } from './lib/torrent-list.js';
@@ -284,8 +286,11 @@ function loadSettings() {
 
 function saveSettings(next) {
   settings = next;
+  // The keys go in the box, encrypted; what localStorage gets has none.
+  const keys = keysOf(next);
+  if (!sameKeys(keys, storedKeys)) storeKeys(keys);
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(withoutKeys(next)));
     return true;
   } catch {
     // They apply all the same, until the page reloads.
@@ -295,6 +300,72 @@ function saveSettings(next) {
 }
 
 let settings = loadSettings();
+
+/*
+ * The cloud services' API keys. localStorage is readable by every page of the origin (on
+ * maxgfr.github.io, every project page of the account), so they are never written there: they are
+ * kept encrypted (AES-GCM, under a non-extractable key) in the swarmdeck-keys database, and put back
+ * into the settings in memory once read — before anything that calls a service runs (cloudKeysReady).
+ * Keys an earlier version left in clear in the settings are encrypted, and only once that is
+ * committed taken out of them.
+ */
+const KEYS_DB = 'swarmdeck-keys';
+const KEYS_ID = 'cloud';
+/** Written after each committed write of the keys, so other open copies read them again. */
+const KEYS_WRITTEN_KEY = 'swarmdeck:keys-written';
+const keyBox = openSecretBox(KEYS_DB);
+const NO_KEYS = { apiKey: '', accounts: {} };
+/** The keys as the box holds them: a save writes them again only when they changed. */
+let storedKeys = NO_KEYS;
+let keysWriting = Promise.resolve(true);
+
+/** The keys written to the box, in order; resolves to whether this write was committed. */
+function storeKeys(keys) {
+  keysWriting = keysWriting.then(async () => {
+    try {
+      await keyBox.write(KEYS_ID, keys);
+      storedKeys = keys;
+      try { localStorage.setItem(KEYS_WRITTEN_KEY, String(Date.now())); } catch { /* the other copies read them at their next start */ }
+      return true;
+    } catch {
+      toast('Your API key could not be stored encrypted in this browser: it works until the page reloads. Nothing was saved in clear.', { error: true, timeout: 9000 });
+      return false;
+    }
+  });
+  return keysWriting;
+}
+
+/** The settings as stored, rewritten without the keys an earlier version kept in them in clear. */
+function forgetClearKeys() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return;
+    const stored = JSON.parse(raw);
+    if (hasKeys(keysOf(stored))) localStorage.setItem(SETTINGS_KEY, JSON.stringify(withoutKeys(stored)));
+  } catch { /* tried again at the next start */ }
+}
+
+/** Keys found in clear: encrypted first, and taken out of the settings only once that is committed. */
+async function adoptClearKeys(clear) {
+  const keys = { apiKey: clear.apiKey || storedKeys.apiKey, accounts: { ...storedKeys.accounts, ...clear.accounts } };
+  if (await storeKeys(keys)) forgetClearKeys();
+  return keys;
+}
+
+const cloudKeysReady = (async () => {
+  const clear = keysOf(settings);
+  try {
+    storedKeys = (await Promise.race([
+      keyBox.read(KEYS_ID),
+      new Promise((resolve, reject) => setTimeout(() => reject(new Error('storage did not answer')), 5000)),
+    ])) || NO_KEYS;
+  } catch {
+    if (!hasKeys(clear)) toast('Your saved API keys could not be read from this browser\'s storage: enter them again in Settings → Cloud fetch.', { error: true, timeout: 9000 });
+  }
+  const keys = hasKeys(clear) ? await adoptClearKeys(clear) : storedKeys;
+  // Saved meanwhile (no key can be, before this): what is in memory now, with the keys.
+  settings = withKeys(settings, keys);
+})();
 
 /* "debug" is the debug library's own key, read by WebTorrent's as it loads: other sites of the origin may
  * use it too, so only the value this app writes counts as on, and only that one is ever removed. */
@@ -1197,6 +1268,7 @@ function pick(obj, ...names) {
  * changes. Without this the server's own page said "No API key yet" and asked for a TorBox key.
  */
 async function adoptOwnServer() {
+  await cloudKeysReady;
   const untouched = () => settings.cloud.provider === DEFAULT_CLOUD_PROVIDER && !settings.cloud.apiKey
     && !Object.values(settings.cloud.accounts || {}).some((a) => a && a.apiKey);
   if (!untouched()) return false;
@@ -2050,6 +2122,7 @@ async function cloudSend({ bytes, name, magnet }) {
 }
 
 async function refreshCloudLibrary({ quiet = false } = {}) {
+  await cloudKeysReady;
   if (!cloudReady() || cloudIsLocalServer()) {
     renderCloudLibrary();
     // Sent from the Cloud tab to the server that runs the list's transfers: the list shows it.
@@ -2116,6 +2189,7 @@ function scheduleCloudPoll() {
 }
 
 async function cloudAccountLine() {
+  await cloudKeysReady;
   if (!cloudReady()) {
     els.cloudAccount.textContent = 'No API key yet: add one in Settings → Cloud fetch.';
     return;
@@ -2503,6 +2577,7 @@ function startCloudPoll(view) {
 }
 
 async function startCloudFetch(view) {
+  await cloudKeysReady;
   if (!cloudReady()) {
     toast('Add your cloud API key first: Settings → Cloud fetch.', { error: true });
     els.settingsBtn.click();
@@ -4818,6 +4893,7 @@ async function answerCall({ id, from, message }) {
 
 /** What a follower asked for, done here as if asked here — without the questions it already asked. */
 async function runCall(message, from = '') {
+  await cloudKeysReady;
   const torrent = torrentFor(message);
   const needed = () => {
     if (!torrent) throw new Error('That torrent is no longer in the list.');
@@ -5226,10 +5302,31 @@ otherCopies?.addEventListener('message', ({ data }) => {
 
 // Settings saved in another open copy apply here too.
 window.addEventListener('storage', (event) => {
+  if (event.key === KEYS_WRITTEN_KEY) {
+    // Keys saved in another copy: read again from the box.
+    keyBox.read(KEYS_ID).then((keys) => {
+      if (!keys) return;
+      storedKeys = keys;
+      if (sameKeys(keys, keysOf(settings))) return;
+      const was = settings;
+      settings = withKeys(settings, keys);
+      settingsChanged(was);
+    }).catch(() => {});
+    return;
+  }
   if (event.key !== SETTINGS_KEY) return;
   const was = settings;
+  const loaded = loadSettings();
+  // Never written there by this version; an older one still open may have.
+  const clear = keysOf(loaded);
+  if (hasKeys(clear)) adoptClearKeys(clear);
   // The Simple / Expert switch of a Settings dialog open here is this copy's own until it is saved.
-  settings = { ...loadSettings(), ...(els.settingsDialog.open ? { expert: was.expert } : {}) };
+  settings = withKeys({ ...loaded, ...(els.settingsDialog.open ? { expert: was.expert } : {}) }, hasKeys(clear) ? clear : keysOf(was));
+  settingsChanged(was);
+});
+
+/** What follows settings changed in another open copy. */
+function settingsChanged(was) {
   applyTrackers();
   applySpeedLimits();
   updateWakeLock();
@@ -5240,7 +5337,7 @@ window.addEventListener('storage', (event) => {
     refreshCloudLibrary({ quiet: true });
     if (!follower) for (const view of views.values()) if (view.cloud && view.cloudRefused) startCloudPoll(view);
   }
-});
+}
 
 /** client.remove() resolves before the store is gone; wait for the destroy callback instead. */
 function removeFromClient(torrent) {
@@ -5479,6 +5576,7 @@ els.magnetForm.addEventListener('submit', async (event) => {
 
 /** A magnet, an info hash or a .torrent link, sent to the cloud account: typed, pasted or dropped. Says what went wrong, and whether it went. */
 async function sendTextToCloud(text) {
+  await cloudKeysReady;
   const id = parseTorrentText(text);
   if (!id) {
     toast('Paste a magnet link, a 40-character info hash, or a .torrent URL.', { error: true });
@@ -5507,6 +5605,7 @@ async function sendTextToCloud(text) {
 
 /** .torrent files sent to the cloud account: picked, pasted or dropped. Anything else is not sent, and why is said. */
 async function sendFilesToCloud(files) {
+  await cloudKeysReady;
   if (!cloudReady() && files.length) {
     toast('Add your cloud API key first: Settings → Cloud fetch.', { error: true });
     els.settingsBtn.click();
@@ -6231,6 +6330,7 @@ document.addEventListener('visibilitychange', updateWakeLock);
 /* ---------- settings dialog ---------- */
 
 async function openSettings() {
+  await cloudKeysReady;
   els.trackersInput.value = settings.trackers.join('\n');
   els.trackerListToggle.checked = Boolean(settings.trackerList);
   els.trackerListUrl.value = settings.trackerListUrl || '';
@@ -6902,6 +7002,8 @@ const started = (async function start() {
     const records = await dbAll();
     records.sort((a, b) => a.addedAt - b.addedAt);
     await cleanOrphanStoresIfAlone(records);
+    // A restored cloud transfer polls its service with the key: read first.
+    await cloudKeysReady;
     return records;
   })();
   const [records] = await Promise.all([storageReady, saver.init()]);
