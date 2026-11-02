@@ -1717,7 +1717,7 @@ try {
       const [download] = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), page.click('#ed-save')]);
       const where = path.join(TMP, `edited-${Date.now()}.torrent`);
       await download.saveAs(where);
-      return { name: download.suggestedFilename(), buf: readFileSync(where) };
+      return { download, buf: readFileSync(where) };
     };
     const hashShown = () => ed.textContent('#editor-hash');
 
@@ -1733,7 +1733,7 @@ try {
     await ed.fill('#ed-comment', 'second');
     await ed.fill('#ed-webseeds', 'https://mirror.example/edit me.bin');
     const same = await savedFrom(ed);
-    assert.equal(same.name, 'edit me.bin.torrent');
+    assertOffered(same.download, 'edit me.bin.torrent');
     assert.equal(infoHashOfFile(same.buf), original.infoHash, 'trackers, comment and web seeds leave the info hash');
     const sameRoot = decodeBencode(new Uint8Array(same.buf));
     assert.deepEqual(sameRoot.get('announce-list').map((tier) => tier.map((u) => Buffer.from(u).toString())), [['wss://new.example'], ['udp://second.example:6969']]);
